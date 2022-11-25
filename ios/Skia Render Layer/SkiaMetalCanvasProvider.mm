@@ -142,6 +142,10 @@ void SkiaMetalCanvasProvider::renderFrameToCanvas(CMSampleBufferRef sampleBuffer
     std::lock_guard lockGuard(*_drawableMutex);
   
     auto surface = _skSurface;
+    if (surface == nil) {
+      NSLog(@"Cannot render Frame, Surface was nil!");
+      return;
+    }
     auto canvas = surface->getCanvas();
     
     // Calculate Center Crop (aspectRatio: cover) transform
