@@ -13,6 +13,7 @@
 #import <include/gpu/GrDirectContext.h>
 #import "SkImage.h"
 #import "SkImageHelpers.h"
+#import "SkSurface.h"
 #include <mutex>
 
 class SkiaMetalCanvasProvider {
@@ -45,15 +46,15 @@ private:
 
   id<MTLCommandQueue> _commandQueue;
   id<MTLDevice> _device;
-  sk_sp<GrDirectContext> _skContext;
   dispatch_queue_t _runLoopQueue;
   
   std::unique_ptr<SkImageHelpers> _imageHelper;
   
-  id<CAMetalDrawable> _currentDrawable;
-  std::mutex _drawableMutex;
+  GrMTLHandle _drawableHandle;
+  sk_sp<SkSurface> _skSurface;
+  std::shared_ptr<std::mutex> _drawableMutex;
   
 private:
-  void runLoop();
+  void runLoop(sk_sp<GrDirectContext> context);
 };
 

@@ -14,7 +14,15 @@
 SkiaMetalCanvasProvider::SkiaMetalCanvasProvider() {
   _device = MTLCreateSystemDefaultDevice();
   _commandQueue = id<MTLCommandQueue>(CFRetain((GrMTLHandle)[_device newCommandQueue]));
+  _commandQueue.label = @"VisionCamera PreviewView";
   _runLoopQueue = dispatch_queue_create("Camera Preview runLoop", DISPATCH_QUEUE_SERIAL);
+  _drawableMutex = std::make_shared<std::mutex>();
+  
+  GrContextOptions grContextOptions;
+  auto context = GrDirectContext::MakeMetal((__bridge void*)_device,
+                                            (__bridge void*)_commandQueue,
+                                            grContextOptions);
+  _imageHelper = std::make_unique<SkImageHelpers>(_device, context);
 
   #pragma clang diagnostic push
   #pragma clang diagnostic ignored "-Wunguarded-availability-new"
@@ -26,47 +34,54 @@ SkiaMetalCanvasProvider::SkiaMetalCanvasProvider() {
   _layer.opaque = false;
   _layer.contentsScale = getPixelDensity();
   _layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+  _layer.contentsGravity = kCAGravityBottomRight;
   
   dispatch_async(_runLoopQueue, ^{
-    runLoop();
+    runLoop(context);
   });
 }
 
 SkiaMetalCanvasProvider::~SkiaMetalCanvasProvider() {
-  if([[NSThread currentThread] isMainThread]) {
-    _layer = nil;
-  } else {
-    __block auto tempLayer = _layer;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      // By using the tempLayer variable in the block we capture it and it will be
-      // released after the block has finished. This way the CAMetalLayer dealloc will
-      // only be called on the main thread. Problem: this destructor might be called from
-      // releasing the RNSkDrawViewImpl from a thread capture (after dtor has started),
-      // which would cause the CAMetalLayer dealloc to be called on another thread which
-      // causes a crash.
-      // https://github.com/Shopify/react-native-skia/issues/398
-      tempLayer = tempLayer;
-    });
-  }
 }
 
-void SkiaMetalCanvasProvider::runLoop() {
-  while (_layer != nil) {
-    @autoreleasepool {
-      // Blocks until the next Frame is ready (16ms at 60 FPS)
-      auto tempDrawable = [_layer nextDrawable];
-      
-      // If the View deallocated in the meantime, just abort.
-      if (_layer == nil) {
-        return;
-      }
-      
+void SkiaMetalCanvasProvider::runLoop(sk_sp<GrDirectContext> context) {
+  while (true) {
+    
+    auto layer = _layer;
+    if (layer == nil) {
+      // View got destroyed. Stop runLoop
+      return;
+    }
+    
+    // Get a writeable SkSurface (this blocks until a new Frame is writeable, 16ms at 60 FPS)
+    auto surface = SkSurface::MakeFromCAMetalLayer(context.get(),
+                                                   (__bridge GrMTLHandle)layer,
+                                                   kTopLeft_GrSurfaceOrigin,
+                                                   1,
+                                                   kBGRA_8888_SkColorType,
+                                                   nullptr,
+                                                   nullptr,
+                                                   &_drawableHandle);
+    
+    if (surface == nullptr || surface->getCanvas() == nullptr) {
+      throw std::runtime_error("Skia surface could not be created from parameters.");
+    }
+    if (_drawableHandle == nullptr) {
+      NSLog(@"Failed to create Metal Drawable!");
+      continue;
+    }
+    if (_layer == nil) {
+      // View got destroyed just right after we got a drawable surface. Stop runLoop
+      NSLog(@"View destroyed, layer nil. Aborting runLoop");
+      return;
+    }
+    
 #if DEBUG
       auto start = CFAbsoluteTimeGetCurrent();
 #endif
-      _drawableMutex.lock();
-      _currentDrawable = tempDrawable;
-      _drawableMutex.unlock();
+      _drawableMutex->lock();
+      _skSurface = surface;
+      _drawableMutex->unlock();
 #if DEBUG
       auto end = CFAbsoluteTimeGetCurrent();
       auto lockTime = (end - start) * 1000;
@@ -74,7 +89,6 @@ void SkiaMetalCanvasProvider::runLoop() {
         NSLog(@"The previous draw call took so long that it blocked a new Frame from coming in for %f ms!", lockTime);
       }
 #endif
-    }
   }
 }
 
@@ -96,54 +110,17 @@ float SkiaMetalCanvasProvider::getScaledHeight() { return _height * getPixelDens
 void SkiaMetalCanvasProvider::renderFrameToCanvas(CMSampleBufferRef sampleBuffer, const std::function<void(SkCanvas*)>& drawCallback) {
   auto start = CFAbsoluteTimeGetCurrent();
   
-  if(_width == -1 && _height == -1) {
+  if (_width == -1 && _height == -1) {
     return;
   }
-
-  if(_skContext == nullptr) {
-    GrContextOptions grContextOptions;
-    _skContext = GrDirectContext::MakeMetal((__bridge void*)_device,
-                                            (__bridge void*)_commandQueue,
-                                            grContextOptions);
-  }
-  if (_imageHelper == nil) {
-    _imageHelper = std::make_unique<SkImageHelpers>(_device, _skContext);
+  if (_layer == nil) {
+    return;
   }
 
   // Wrap in auto release pool since we want the system to clean up after rendering
   // and not wait until later - we've seen some example of memory usage growing very
   // fast in the simulator without this.
   @autoreleasepool {
-    // Lock Mutex to block the runLoop from overwriting the _currentDrawable
-    std::lock_guard lockGuard(_drawableMutex);
-    
-    id<CAMetalDrawable> currentDrawable = _currentDrawable;
-    
-    // No Drawable is ready. Abort
-    if (currentDrawable == nullptr) {
-      return;
-    }
-    
-    // Get & Lock the writeable Texture from the Metal Drawable
-    GrMtlTextureInfo fbInfo;
-    fbInfo.fTexture.retain((__bridge void*)currentDrawable.texture);
-    
-    GrBackendRenderTarget backendRT(_layer.drawableSize.width,
-                                    _layer.drawableSize.height,
-                                    1,
-                                    fbInfo);
-    
-    // Create a Skia Surface from the writable Texture
-    auto skSurface = SkSurface::MakeFromBackendRenderTarget(_skContext.get(),
-                                                            backendRT,
-                                                            kTopLeft_GrSurfaceOrigin,
-                                                            kBGRA_8888_SkColorType,
-                                                            nullptr,
-                                                            nullptr);
-    
-    if(skSurface == nullptr || skSurface->getCanvas() == nullptr) {
-      throw std::runtime_error("Skia surface could not be created from parameters.");
-    }
     
     auto format = CMSampleBufferGetFormatDescription(sampleBuffer);
     NSLog(@"%lu : %@ : %u : %u", CMFormatDescriptionGetTypeID(), CMFormatDescriptionGetExtensions(format), (unsigned int)CMFormatDescriptionGetMediaType(format), (unsigned int)CMFormatDescriptionGetMediaSubType(format));
@@ -161,7 +138,11 @@ void SkiaMetalCanvasProvider::renderFrameToCanvas(CMSampleBufferRef sampleBuffer
     // Converts the CMSampleBuffer to an SkImage - YUV or RGB.
     auto image = _imageHelper->convertCMSampleBufferToSkImage(sampleBuffer);
     
-    auto canvas = skSurface->getCanvas();
+    // Lock Mutex to block the runLoop from overwriting the new _skSurface
+    std::lock_guard lockGuard(*_drawableMutex);
+  
+    auto surface = _skSurface;
+    auto canvas = surface->getCanvas();
     
     // Calculate Center Crop (aspectRatio: cover) transform
     auto surfaceWidth = canvas->getSurface()->width();
@@ -197,9 +178,10 @@ void SkiaMetalCanvasProvider::renderFrameToCanvas(CMSampleBufferRef sampleBuffer
     canvas->restore();
     
     // Flush all appended operations on the canvas and commit it to the SkSurface
-    canvas->flush();
+    surface->flushAndSubmit();
     
     // Pass the drawable into the Metal Command Buffer and submit it to the GPU
+    id<CAMetalDrawable> currentDrawable = (__bridge id<CAMetalDrawable>)_drawableHandle;
     id<MTLCommandBuffer> commandBuffer([_commandQueue commandBuffer]);
     [commandBuffer presentDrawable:currentDrawable];
     [commandBuffer commit];
