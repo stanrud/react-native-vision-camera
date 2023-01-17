@@ -90,6 +90,9 @@
     "react": "*",
     "react-native": "*"
   },
+  "dependencies": {
+    "react-native-worklets": "^0.0.1-alpha"
+  },
   "prettier": {
     "bracketSpacing": true,
     "bracketSameLine": true,
